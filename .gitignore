@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# DuckDB database
+*.duckdb
+*.duckdb.wal
+
+# Generated outputs
+outputs/
+
+# OS / IDE
+.DS_Store
+.vscode/
