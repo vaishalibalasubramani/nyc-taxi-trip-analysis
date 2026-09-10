@@ -1,0 +1,11 @@
+﻿.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+data/raw/
+data/processed/
+*.parquet
+.env
+
+full_output.txt
+train_log.txt

@@ -1,0 +1,32 @@
+Demand Model Validation Report
+5-fold TimeSeriesSplit cross-validation
+======================================================================
+
+Task 2 (Green Taxi)
+  Model MAE:  7.50 (+/- 0.28)
+  Model R2:   0.923 (+/- 0.010)
+  Mean baseline MAE:        31.25
+  Persistence (t-1h) MAE:   12.54
+  Seasonal-naive (t-1wk) MAE: 9.87
+
+Task 3 (Green Taxi)
+  Model MAE:  0.16 (+/- 0.01)
+  Model R2:   0.880 (+/- 0.012)
+  Mean baseline MAE:        0.52
+  Persistence (t-1h) MAE:   0.18
+  Seasonal-naive (t-1wk) MAE: 0.18
+
+Task 2 (HVFHV (Uber/Lyft))
+  Model MAE:  1399.57 (+/- 151.43)
+  Model R2:   0.966 (+/- 0.005)
+  Mean baseline MAE:        8791.42
+  Persistence (t-1h) MAE:   3460.57
+  Seasonal-naive (t-1wk) MAE: 2204.77
+
+Task 3 (HVFHV (Uber/Lyft))
+  Model MAE:  13.25 (+/- 1.13)
+  Model R2:   0.953 (+/- 0.005)
+  Mean baseline MAE:        81.37
+  Persistence (t-1h) MAE:   20.36
+  Seasonal-naive (t-1wk) MAE: 18.11
+
