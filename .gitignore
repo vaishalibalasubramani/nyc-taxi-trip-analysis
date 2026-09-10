@@ -14,8 +14,13 @@ venv/
 # Generated outputs
 outputs/
 
+# Generated data
+data/
+*.parquet
+
 # OS / IDE
 .DS_Store
 .vscode/
 
-data/
+# Environment
+.env

@@ -1,0 +1,5 @@
+Data Quality Audit Report
+======================================================================
+
+1 item(s) flagged:
+  - Green Taxi: trip_features has NULL values (see above)
