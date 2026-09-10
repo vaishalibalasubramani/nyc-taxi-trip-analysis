@@ -12,11 +12,16 @@ venv/
 *.duckdb.wal
 
 # Generated outputs
-outputs/
+outputs/*.parquet
 
 # Generated data
-data/
-*.parquet
+data/raw/
+data/processed/*.parquet
+
+# Allow processed files required by the dashboard
+!data/processed/hvfhv_hourly_demand.parquet
+!data/processed/hvfhv_trip_features.parquet
+!data/processed/hvfhv_zone_hourly_demand.parquet
 
 # OS / IDE
 .DS_Store
