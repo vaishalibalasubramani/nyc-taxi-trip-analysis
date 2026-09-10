@@ -1,0 +1,24 @@
+Duration Model Validation Report
+5-fold cross-validation, 15mph physics baseline
+======================================================================
+
+Green Taxi
+  Rows validated: 500,898
+  CV MAE:  191.9s (+/- 0.9s)
+  CV RMSE: 342.0s
+  CV R2:   0.713 (+/- 0.007)
+  Mean-duration baseline MAE:      427.9s (R2 -0.000)
+  Distance/15mph baseline MAE:   342.4s (R2 0.305)
+  Improvement vs. mean baseline:   55%
+  Improvement vs. physics baseline: 44%
+
+HVFHV (Uber/Lyft)
+  Rows validated: 1,999,992
+  CV MAE:  249.2s (+/- 0.2s)
+  CV RMSE: 378.1s
+  CV R2:   0.802 (+/- 0.000)
+  Mean-duration baseline MAE:      624.2s (R2 -0.000)
+  Distance/15mph baseline MAE:   496.3s (R2 -0.047)
+  Improvement vs. mean baseline:   60%
+  Improvement vs. physics baseline: 50%
+

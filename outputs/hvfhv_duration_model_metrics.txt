@@ -1,0 +1,15 @@
+MAE:  249.03 seconds
+RMSE: 378.31 seconds
+R2:   0.8022
+
+Feature importances:
+trip_miles           0.885617
+pickup_hour          0.071607
+DOLocationID         0.016780
+PULocationID         0.010537
+is_weekend           0.006485
+pickup_month         0.003834
+pickup_dow           0.003510
+is_shared_request    0.001175
+is_wav_request       0.000231
+hvfhs_license_num    0.000224
