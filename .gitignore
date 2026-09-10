@@ -17,3 +17,5 @@ outputs/
 # OS / IDE
 .DS_Store
 .vscode/
+
+data/
