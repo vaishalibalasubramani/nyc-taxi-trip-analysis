@@ -114,6 +114,10 @@ PATHS = {
     },
 }
 
+# Every dataset in this project should be scoped to calendar-year 2025 only.
+YEAR_START = date(2025, 1, 1)
+YEAR_END = date(2025, 12, 31)
+
 # ============================================================================
 # CACHED LOADERS
 # ============================================================================
@@ -160,6 +164,8 @@ def load_hourly_series(hourly_path: Path):
             pickup_hour_ts,
             trip_count
         FROM read_parquet('{hourly_path.as_posix()}')
+        WHERE pickup_hour_ts >= TIMESTAMP '{YEAR_START.isoformat()}'
+          AND pickup_hour_ts < TIMESTAMP '{(date(YEAR_END.year + 1, 1, 1)).isoformat()}'
         ORDER BY pickup_hour_ts
         """
     ).df()
@@ -184,6 +190,8 @@ def load_zone_series(zone_path: Path, zone_id: int):
             trip_count
         FROM read_parquet('{zone_path.as_posix()}')
         WHERE zone_id = {int(zone_id)}
+          AND pickup_hour_ts >= TIMESTAMP '{YEAR_START.isoformat()}'
+          AND pickup_hour_ts < TIMESTAMP '{(date(YEAR_END.year + 1, 1, 1)).isoformat()}'
         ORDER BY pickup_hour_ts
         """
     ).df()
@@ -362,16 +370,24 @@ def resolve_trip_distance(
 @st.cache_data(show_spinner=False)
 def load_data_date_range(hourly_demand_path: Path) -> tuple:
     if not hourly_demand_path.exists():
-        return date(2025, 1, 1), date(2025, 12, 31)
+        return YEAR_START, YEAR_END
     row = duckdb.sql(
         f"""
         SELECT min(pickup_hour_ts), max(pickup_hour_ts)
         FROM read_parquet('{hourly_demand_path.as_posix()}')
+        WHERE pickup_hour_ts >= TIMESTAMP '{YEAR_START.isoformat()}'
+          AND pickup_hour_ts < TIMESTAMP '{(date(YEAR_END.year + 1, 1, 1)).isoformat()}'
         """
     ).fetchone()
     if row and row[0] is not None:
-        return pd.Timestamp(row[0]).date(), pd.Timestamp(row[1]).date()
-    return date(2025, 1, 1), date(2025, 12, 31)
+        lo = pd.Timestamp(row[0]).date()
+        hi = pd.Timestamp(row[1]).date()
+        # Clip defensively to 2025 even if the file somehow contains
+        # stray timestamps outside the target year.
+        lo = max(lo, YEAR_START)
+        hi = min(hi, YEAR_END)
+        return lo, hi
+    return YEAR_START, YEAR_END
 
 
 # ============================================================================
@@ -630,6 +646,87 @@ def parse_metrics_txt(path: Path):
 
 
 @st.cache_data(show_spinner=False)
+def duration_metrics_with_fallback(
+    metrics_path: Path,
+    predictions_path: Path,
+):
+    """
+    Load duration metrics from the saved metrics TXT.
+
+    If that TXT is missing/incomplete, calculate MAE/RMSE/R² directly
+    from the saved actual-vs-predicted duration Parquet. This is useful
+    for older Yellow Taxi outputs where the prediction file exists but
+    the separate metrics TXT was not saved.
+    """
+    metrics = parse_metrics_txt(metrics_path)
+
+    required = ("MAE", "RMSE", "R2")
+    if all(metrics.get(key) is not None for key in required):
+        return metrics
+
+    if not predictions_path.exists():
+        return metrics
+
+    try:
+        row = duckdb.sql(
+            f"""
+            WITH p AS (
+                SELECT
+                    actual,
+                    predicted
+                FROM read_parquet('{predictions_path.as_posix()}')
+                WHERE actual IS NOT NULL
+                  AND predicted IS NOT NULL
+            ),
+            stats AS (
+                SELECT avg(actual) AS mean_actual
+                FROM p
+            )
+            SELECT
+                avg(abs(actual - predicted)) AS mae,
+                sqrt(avg(power(actual - predicted, 2))) AS rmse,
+                CASE
+                    WHEN sum(
+                        power(
+                            actual - (SELECT mean_actual FROM stats),
+                            2
+                        )
+                    ) = 0
+                    THEN NULL
+                    ELSE
+                        1
+                        - sum(power(actual - predicted, 2))
+                        /
+                        sum(
+                            power(
+                                actual - (SELECT mean_actual FROM stats),
+                                2
+                            )
+                        )
+                END AS r2
+            FROM p
+            """
+        ).fetchone()
+
+        if row and any(value is not None for value in row):
+            fallback = {
+                "MAE": row[0],
+                "RMSE": row[1],
+                "R2": row[2],
+            }
+
+            # Preserve feature importances if the TXT existed.
+            if "importances" in metrics:
+                fallback["importances"] = metrics["importances"]
+
+            return fallback
+
+    except Exception:
+        pass
+
+    return metrics
+
+
 def sql_regression_metrics(predictions_path: Path):
 
     if not predictions_path.exists():
@@ -692,6 +789,122 @@ def sql_regression_metrics(predictions_path: Path):
         "RMSE": row[1],
         "R2": row[2],
     }
+
+
+# ============================================================================
+# SHARED ACTUAL-VS-PREDICTED CHART HELPERS
+# ============================================================================
+
+def actual_vs_predicted_duration_chart(predictions_path: Path, vehicle: str):
+    """
+    Build the actual-vs-predicted trip-duration line chart from the saved
+    test-set predictions parquet. Returns None if unavailable.
+    """
+    if not predictions_path.exists():
+        return None
+
+    duration_df = duckdb.sql(
+        f"""
+        SELECT *
+        FROM read_parquet('{predictions_path.as_posix()}')
+        """
+    ).df()
+
+    if (
+        duration_df.empty
+        or "actual" not in duration_df.columns
+        or "predicted" not in duration_df.columns
+    ):
+        return None
+
+    duration_df["actual_minutes"] = duration_df["actual"] / 60.0
+    duration_df["predicted_minutes"] = duration_df["predicted"] / 60.0
+
+    chart_df = duration_df.head(5000).copy()
+    chart_df["Trip"] = range(1, len(chart_df) + 1)
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=chart_df["Trip"],
+            y=chart_df["actual_minutes"],
+            name="Actual",
+            mode="lines",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=chart_df["Trip"],
+            y=chart_df["predicted_minutes"],
+            name="Predicted",
+            mode="lines",
+        )
+    )
+    fig.update_layout(
+        title=f"{vehicle} — Actual vs Predicted Trip Duration (test trips)",
+        xaxis_title="Test trips",
+        yaxis_title="Duration (minutes)",
+    )
+    return fig
+
+
+def actual_vs_predicted_series_chart(
+    predictions_path: Path,
+    vehicle: str,
+    title_suffix: str,
+    y_title: str = "Trips / hour",
+):
+    """
+    Build a time-indexed actual-vs-predicted chart from a saved demand
+    predictions parquet (citywide or zone level). Returns None if the
+    file is unavailable or lacks the expected columns.
+    """
+    if not predictions_path.exists():
+        return None
+
+    df = duckdb.sql(
+        f"""
+        SELECT *
+        FROM read_parquet('{predictions_path.as_posix()}')
+        """
+    ).df()
+
+    if df.empty or "actual" not in df.columns or "predicted" not in df.columns:
+        return None
+
+    if "pickup_hour_ts" in df.columns:
+        df["pickup_hour_ts"] = pd.to_datetime(df["pickup_hour_ts"])
+        df = df.sort_values("pickup_hour_ts")
+        x = df["pickup_hour_ts"]
+        x_title = "Time"
+    else:
+        df = df.reset_index(drop=True)
+        x = df.index
+        x_title = "Test rows"
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=x, y=df["actual"], name="Actual"))
+    fig.add_trace(go.Scatter(x=x, y=df["predicted"], name="Predicted"))
+    fig.update_layout(
+        title=f"{vehicle} — Actual vs Predicted {title_suffix}",
+        xaxis_title=x_title,
+        yaxis_title=y_title,
+    )
+    return fig
+
+
+def highlight_point_on_chart(fig: go.Figure, x_value, y_value, label: str):
+    """Overlay a single marker (this prediction) on an existing chart."""
+    fig.add_trace(
+        go.Scatter(
+            x=[x_value],
+            y=[y_value],
+            mode="markers",
+            name=label,
+            marker=dict(size=14, symbol="star", color="red"),
+        )
+    )
+    return fig
 
 
 # ============================================================================
@@ -760,6 +973,121 @@ def get_duration_reference(
         }
     except Exception:
         return None
+
+
+@st.cache_data(show_spinner=False)
+def load_top_pickup_zones(zone_path: Path, limit: int = 10) -> pd.DataFrame:
+    """Return the busiest pickup zones for the selected vehicle."""
+    if not zone_path.exists():
+        return pd.DataFrame(
+            columns=["zone_id", "zone_name", "borough", "total_trips"]
+        )
+
+    try:
+        return duckdb.sql(
+            f"""
+            SELECT
+                zone_id,
+                any_value(zone_name) AS zone_name,
+                any_value(borough) AS borough,
+                SUM(trip_count) AS total_trips
+            FROM read_parquet('{zone_path.as_posix()}')
+            GROUP BY zone_id
+            ORDER BY total_trips DESC
+            LIMIT {int(limit)}
+            """
+        ).df()
+    except Exception:
+        return pd.DataFrame(
+            columns=["zone_id", "zone_name", "borough", "total_trips"]
+        )
+
+
+def vehicle_focus_section(vehicle: str, cfg: dict):
+    """
+    Show where the selected vehicle type is most concentrated.
+
+    The ranking is calculated directly from the vehicle's zone-level
+    hourly demand data, so the dashboard reports the actual top pickup
+    zones in the project dataset rather than generic NYC assumptions.
+    """
+    st.divider()
+    st.subheader(f"Where {vehicle} Trips Mainly Concentrate")
+
+    st.caption(
+        "Top pickup zones based on the total number of trips recorded "
+        "in the selected vehicle's zone-level demand dataset."
+    )
+
+    top = load_top_pickup_zones(
+        cfg["zone_hourly_demand"],
+        limit=10,
+    )
+
+    if top.empty:
+        st.info(
+            "Zone-level demand data is not available for this vehicle."
+        )
+        return
+
+    top["zone_label"] = (
+        top["zone_name"].fillna(top["zone_id"].astype(str))
+        + " ("
+        + top["borough"].fillna("Unknown")
+        + ")"
+    )
+
+    # The first row is the exact busiest pickup zone in this dataset.
+    busiest = top.iloc[0]
+
+    st.success(
+        f"**Main focus:** {busiest['zone_label']} has the highest "
+        f"pickup concentration for {vehicle}, with "
+        f"**{busiest['total_trips']:,.0f} trips** in the dataset."
+    )
+
+    chart_df = top.sort_values("total_trips")
+
+    fig = px.bar(
+        chart_df,
+        x="total_trips",
+        y="zone_label",
+        orientation="h",
+        title=f"Top 10 Pickup Zones — {vehicle}",
+        labels={
+            "total_trips": "Total trips",
+            "zone_label": "Pickup zone",
+        },
+    )
+
+    fig.update_layout(
+        height=500,
+        showlegend=False,
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+    )
+
+    display_df = top[
+        ["zone_id", "zone_name", "borough", "total_trips"]
+    ].copy()
+
+    display_df.columns = [
+        "Zone ID",
+        "Zone",
+        "Borough",
+        "Total trips",
+    ]
+
+    display_df["Total trips"] = display_df["Total trips"].round(0).astype(int)
+
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 def predict_duration_tab():
@@ -887,20 +1215,24 @@ def predict_duration_tab():
             st.dataframe(X, use_container_width=True)
         return
 
+    prediction_minutes = prediction_seconds / 60.0
+
     st.divider()
 
-    # Keep the blue same-zone message from the original UI.
+    # Same-zone trips: show only the informational message.
+    # Do not display trip duration or trip distance for this case.
     if same_zone:
         st.info(
             f"📍 **Same zone trip** — pickup and drop-off are both "
             f"**{pickup_label}**. The model is predicting a trip that "
             f"starts and ends within the same taxi zone."
         )
-    else:
-        st.caption(
-            f"Route type: **Different zones** — "
-            f"{pickup_label} → {dropoff_label}"
-        )
+        return
+
+    st.caption(
+        f"Route type: **Different zones** — "
+        f"{pickup_label} → {dropoff_label}"
+    )
 
     c1, c2 = st.columns(2)
     c1.metric(
@@ -926,12 +1258,44 @@ def predict_duration_tab():
     else:
         c2.metric("Trip distance", "Not available")
 
-    if defaulted:
-        with st.expander("Show model input"):
-            st.dataframe(X, use_container_width=True)
+    with st.expander("Show model input"):
+        st.dataframe(X, use_container_width=True)
+
+    # ------------------------------------------------------------------
+    # ACTUAL VS PREDICTED — every prediction gets a chart, since Oct/Nov/
+    # Dec pickup dates fall in the held-out test period for these models.
+    # ------------------------------------------------------------------
+    st.divider()
+    st.markdown("#### How this prediction compares to the test set")
+
+    dur_fig = actual_vs_predicted_duration_chart(
+        cfg["duration_predictions"], vehicle
+    )
+    if dur_fig is not None:
+        highlight_point_on_chart(
+            dur_fig,
+            x_value=1,
+            y_value=prediction_minutes,
+            label="This prediction",
+        )
+        st.plotly_chart(dur_fig, use_container_width=True)
+        st.caption(
+            "The line chart shows actual vs. predicted duration across the "
+            "model's saved test trips. The red star marks this prediction's "
+            "duration for reference, not its exact position in the test set."
+        )
     else:
-        with st.expander("Show model input"):
-            st.dataframe(X, use_container_width=True)
+        st.info(
+            "Saved test-set predictions were not found for this vehicle, "
+            "so an actual-vs-predicted comparison chart can't be shown."
+        )
+
+    # Vehicle-specific concentration analysis.
+    # This updates automatically when the user changes Vehicle type.
+    vehicle_focus_section(
+        vehicle,
+        cfg,
+    )
 
 
 # ----------------------------------------------------------------------------
@@ -1004,6 +1368,8 @@ def predict_citywide_demand_tab():
             target_date = st.date_input(
                 "Forecast date",
                 value=series.index.max().date(),
+                min_value=YEAR_START,
+                max_value=YEAR_END,
                 key="citywide_date",
             )
 
@@ -1108,6 +1474,37 @@ def predict_citywide_demand_tab():
             use_container_width=True,
         )
 
+    # ------------------------------------------------------------------
+    # ACTUAL VS PREDICTED CHART FOR THIS VEHICLE'S TEST SET
+    # ------------------------------------------------------------------
+    st.divider()
+    st.markdown("#### How this prediction compares to the test set")
+
+    demand_fig = actual_vs_predicted_series_chart(
+        cfg["demand_predictions"],
+        vehicle,
+        title_suffix="Citywide Demand",
+        y_title="Trips / hour",
+    )
+    if demand_fig is not None:
+        highlight_point_on_chart(
+            demand_fig,
+            x_value=target_ts,
+            y_value=prediction,
+            label="This prediction",
+        )
+        st.plotly_chart(demand_fig, use_container_width=True)
+        st.caption(
+            "The line chart shows actual vs. predicted citywide demand "
+            "across the model's saved test hours. The red star marks this "
+            "prediction's value at the selected forecast time."
+        )
+    else:
+        st.info(
+            "Saved test-set predictions were not found for this vehicle, "
+            "so an actual-vs-predicted comparison chart can't be shown."
+        )
+
 
 # ----------------------------------------------------------------------------
 # TASK 3 — ZONE DEMAND
@@ -1189,6 +1586,8 @@ def predict_zone_demand_tab():
             target_date = st.date_input(
                 "Forecast date",
                 value=date(2025, 12, 1),
+                min_value=YEAR_START,
+                max_value=YEAR_END,
                 key="zone_date",
             )
 
@@ -1313,6 +1712,82 @@ def predict_zone_demand_tab():
             use_container_width=True,
         )
 
+    # ------------------------------------------------------------------
+    # ACTUAL VS PREDICTED CHART FOR THIS ZONE'S TEST SET
+    # ------------------------------------------------------------------
+    st.divider()
+    st.markdown("#### How this prediction compares to the test set")
+
+    zone_pred_path = cfg["zone_demand_predictions"]
+    zone_fig = None
+
+    if zone_pred_path.exists():
+        try:
+            zone_pred_df = duckdb.sql(
+                f"""
+                SELECT pickup_hour_ts, actual, predicted
+                FROM read_parquet('{zone_pred_path.as_posix()}')
+                WHERE zone_id = {int(zone_id)}
+                ORDER BY pickup_hour_ts
+                """
+            ).df()
+        except Exception:
+            zone_pred_df = pd.DataFrame()
+
+        if not zone_pred_df.empty:
+            zone_pred_df["pickup_hour_ts"] = pd.to_datetime(
+                zone_pred_df["pickup_hour_ts"]
+            )
+            zone_fig = go.Figure()
+            zone_fig.add_trace(
+                go.Scatter(
+                    x=zone_pred_df["pickup_hour_ts"],
+                    y=zone_pred_df["actual"],
+                    name="Actual",
+                )
+            )
+            zone_fig.add_trace(
+                go.Scatter(
+                    x=zone_pred_df["pickup_hour_ts"],
+                    y=zone_pred_df["predicted"],
+                    name="Predicted",
+                )
+            )
+            zone_fig.update_layout(
+                title=f"{vehicle} — Zone {zone_id}: Actual vs Predicted (test hours)",
+                xaxis_title="Time",
+                yaxis_title="Trips / hour",
+            )
+
+    if zone_fig is None:
+        # Fall back to the vehicle-wide zone-demand test set if this
+        # specific zone has no saved test rows.
+        zone_fig = actual_vs_predicted_series_chart(
+            zone_pred_path,
+            vehicle,
+            title_suffix="Zone Demand (all zones, test set)",
+            y_title="Trips / hour",
+        )
+
+    if zone_fig is not None:
+        highlight_point_on_chart(
+            zone_fig,
+            x_value=target_ts,
+            y_value=prediction,
+            label="This prediction",
+        )
+        st.plotly_chart(zone_fig, use_container_width=True)
+        st.caption(
+            "The line chart shows actual vs. predicted demand for this zone "
+            "across the model's saved test hours. The red star marks this "
+            "prediction's value at the selected forecast time."
+        )
+    else:
+        st.info(
+            "Saved test-set predictions were not found for this vehicle, "
+            "so an actual-vs-predicted comparison chart can't be shown."
+        )
+
 
 # ============================================================================
 # PREDICT PAGE
@@ -1326,7 +1801,8 @@ def page_predict():
 
     st.caption(
         "Interactive predictions using the trained "
-        "taxi and for-hire-vehicle machine-learning models."
+        "taxi and for-hire-vehicle machine-learning models "
+        "(2025 data only)."
     )
 
     tab1, tab2, tab3 = st.tabs(
@@ -1380,8 +1856,9 @@ def dashboard_duration(
 
     st.subheader("Task 1 — Trip Duration Prediction")
 
-    metrics = parse_metrics_txt(
-        cfg["duration_metrics"]
+    metrics = duration_metrics_with_fallback(
+        cfg["duration_metrics"],
+        cfg["duration_predictions"],
     )
 
     if not metrics:
@@ -1426,80 +1903,21 @@ def dashboard_duration(
     # ACTUAL VS PREDICTED DURATION
     # ------------------------------------------------------------------------
 
-    predictions_path = cfg["duration_predictions"]
+    dur_fig = actual_vs_predicted_duration_chart(
+        cfg["duration_predictions"], vehicle
+    )
 
-    if predictions_path.exists():
+    if dur_fig is not None:
+        st.plotly_chart(dur_fig, use_container_width=True)
 
-        duration_df = duckdb.sql(
-            f"""
-            SELECT *
-            FROM read_parquet(
-                '{predictions_path.as_posix()}'
-            )
+        explanation_box(
             """
-        ).df()
-
-        if (
-            not duration_df.empty
-            and "actual" in duration_df.columns
-            and "predicted" in duration_df.columns
-        ):
-
-            duration_df["actual_minutes"] = (
-                duration_df["actual"] / 60.0
-            )
-
-            duration_df["predicted_minutes"] = (
-                duration_df["predicted"] / 60.0
-            )
-
-            # Keep the chart readable.
-            chart_df = duration_df.head(5000).copy()
-
-            chart_df["Trip"] = range(1, len(chart_df) + 1)
-
-            fig = go.Figure()
-
-            fig.add_trace(
-                go.Scatter(
-                    x=chart_df["Trip"],
-                    y=chart_df["actual_minutes"],
-                    name="Actual",
-                    mode="lines",
-                )
-            )
-
-            fig.add_trace(
-                go.Scatter(
-                    x=chart_df["Trip"],
-                    y=chart_df["predicted_minutes"],
-                    name="Predicted",
-                    mode="lines",
-                )
-            )
-
-            fig.update_layout(
-                title=(
-                    f"{vehicle} — Actual vs Predicted "
-                    "Trip Duration"
-                ),
-                xaxis_title="Test trips",
-                yaxis_title="Duration (minutes)",
-            )
-
-            st.plotly_chart(
-                fig,
-                use_container_width=True,
-            )
-
-            explanation_box(
-                """
-                This chart compares the <b>actual trip duration</b>
-                with the <b>model-predicted duration</b> for trips
-                in the saved test predictions. Both values are shown
-                in minutes so the comparison is directly understandable.
-                """
-            )
+            This chart compares the <b>actual trip duration</b>
+            with the <b>model-predicted duration</b> for trips
+            in the saved test predictions. Both values are shown
+            in minutes so the comparison is directly understandable.
+            """
+        )
 
     # ------------------------------------------------------------------------
     # FEATURE IMPORTANCE
@@ -1576,60 +1994,15 @@ def dashboard_demand(
     # ACTUAL VS PREDICTED
     # ------------------------------------------------------------------------
 
-    pred_path = cfg[
-        "demand_predictions"
-    ]
+    demand_fig = actual_vs_predicted_series_chart(
+        cfg["demand_predictions"],
+        vehicle,
+        title_suffix="Citywide Demand",
+        y_title="Trips / hour",
+    )
 
-    df = duckdb.sql(
-        f"""
-        SELECT *
-        FROM read_parquet(
-            '{pred_path.as_posix()}'
-        )
-        """
-    ).df()
-
-    if "pickup_hour_ts" in df.columns:
-
-        df["pickup_hour_ts"] = pd.to_datetime(
-            df["pickup_hour_ts"]
-        )
-
-        df = df.sort_values(
-            "pickup_hour_ts"
-        )
-
-        fig = go.Figure()
-
-        fig.add_trace(
-            go.Scatter(
-                x=df["pickup_hour_ts"],
-                y=df["actual"],
-                name="Actual",
-            )
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=df["pickup_hour_ts"],
-                y=df["predicted"],
-                name="Predicted",
-            )
-        )
-
-        fig.update_layout(
-            title=(
-                f"{vehicle} — Actual vs Predicted "
-                "Citywide Demand"
-            ),
-            xaxis_title="Time",
-            yaxis_title="Trips / hour",
-        )
-
-        st.plotly_chart(
-            fig,
-            use_container_width=True,
-        )
+    if demand_fig is not None:
+        st.plotly_chart(demand_fig, use_container_width=True)
 
     explanation_box(
         f"""
@@ -1645,6 +2018,46 @@ def dashboard_demand(
 # ============================================================================
 # TASK 3 PERFORMANCE
 # ============================================================================
+
+@st.cache_data(show_spinner=False)
+def select_accurate_zone_for_chart(
+    preds_path: Path,
+    min_rows: int = 200,
+    min_avg_actual: float = 5.0,
+) -> int:
+    """
+    Pick a zone whose saved test-set rows make a clear, trustworthy
+    actual-vs-predicted chart: enough test rows, enough real trip volume
+    to show meaningful variation, and low relative error (MAE relative
+    to average actual trips). Returns None if no zone qualifies.
+    """
+    if not preds_path.exists():
+        return None
+
+    try:
+        df = duckdb.sql(
+            f"""
+            SELECT
+                zone_id,
+                count(*) AS n,
+                avg(actual) AS avg_actual,
+                avg(abs(actual - predicted)) AS mae
+            FROM read_parquet('{preds_path.as_posix()}')
+            GROUP BY zone_id
+            HAVING count(*) >= {min_rows}
+               AND avg(actual) >= {min_avg_actual}
+            """
+        ).df()
+    except Exception:
+        return None
+
+    if df.empty:
+        return None
+
+    df["relative_error"] = df["mae"] / df["avg_actual"]
+    best = df.sort_values("relative_error").iloc[0]
+    return int(best["zone_id"])
+
 
 def dashboard_zone_demand(
     cfg: dict,
@@ -1789,6 +2202,64 @@ def dashboard_zone_demand(
     # ACTUAL VS PREDICTED SAMPLE
     # ------------------------------------------------------------------------
 
+    # Yellow Taxi and Green Taxi: pick a zone with enough test data and
+    # low relative error, so the sample chart is actually representative
+    # instead of whichever zone happens to appear first chronologically.
+    if vehicle in ("Yellow Taxi", "Green Taxi"):
+        accurate_zone = select_accurate_zone_for_chart(preds_path)
+    else:
+        accurate_zone = None
+
+    if accurate_zone is not None:
+
+        zone_sample = duckdb.sql(
+            f"""
+            SELECT pickup_hour_ts, actual, predicted
+            FROM read_parquet('{preds_path.as_posix()}')
+            WHERE zone_id = {accurate_zone}
+            ORDER BY pickup_hour_ts
+            """
+        ).df()
+
+        if not zone_sample.empty:
+            zone_sample["pickup_hour_ts"] = pd.to_datetime(
+                zone_sample["pickup_hour_ts"]
+            )
+
+            fig2 = go.Figure()
+
+            fig2.add_trace(
+                go.Scatter(
+                    x=zone_sample["pickup_hour_ts"],
+                    y=zone_sample["actual"],
+                    name="Actual",
+                )
+            )
+
+            fig2.add_trace(
+                go.Scatter(
+                    x=zone_sample["pickup_hour_ts"],
+                    y=zone_sample["predicted"],
+                    name="Predicted",
+                )
+            )
+
+            fig2.update_layout(
+                title=(
+                    f"{vehicle} — Zone {accurate_zone}: "
+                    "Actual vs Predicted"
+                ),
+                xaxis_title="Time",
+                yaxis_title="Trips / hour",
+            )
+
+            st.plotly_chart(
+                fig2,
+                use_container_width=True,
+            )
+
+        return
+
     zone_pred = duckdb.sql(
         f"""
         SELECT
@@ -1882,7 +2353,7 @@ def page_dashboard():
 
     st.caption(
         "Performance of all twelve trained models: "
-        "Yellow Taxi, FHV, Green Taxi and HVFHV."
+        "Yellow Taxi, FHV, Green Taxi and HVFHV (2025 data only)."
     )
 
     tabs = st.tabs(
@@ -1890,6 +2361,8 @@ def page_dashboard():
             "Executive Summary",
             "Yellow Taxi",
             "FHV",
+            "Green Taxi",
+            "HVFHV (Uber/Lyft)",
         ]
     )
 
@@ -1907,110 +2380,138 @@ def page_dashboard():
 
         for vehicle, cfg in PATHS.items():
 
-            # Duration
-            dur = parse_metrics_txt(
-                cfg["duration_metrics"]
+            # --------------------------------------------------------------
+            # Task 1 — Trip Duration
+            # --------------------------------------------------------------
+            dur = duration_metrics_with_fallback(
+                cfg["duration_metrics"],
+                cfg["duration_predictions"],
             )
 
-            if dur:
+            rows.append(
+                {
+                    "Vehicle": vehicle,
+                    "Task": "Trip Duration",
+                    "MAE": (
+                        dur.get("MAE") / 60.0
+                        if dur.get("MAE") is not None
+                        else None
+                    ),
+                    "R²": dur.get("R2"),
+                    "Status": (
+                        "Available"
+                        if dur.get("MAE") is not None
+                        and dur.get("R2") is not None
+                        else "Unavailable"
+                    ),
+                }
+            )
 
-                rows.append(
-                    {
-                        "Vehicle":
-                            vehicle,
-
-                        "Task":
-                            "Trip Duration",
-
-                        "MAE":
-                            dur.get("MAE"),
-
-                        "R²":
-                            dur.get("R2"),
-                    }
-                )
-
-            # Citywide
+            # --------------------------------------------------------------
+            # Task 2 — Citywide Demand
+            # --------------------------------------------------------------
             dem = sql_regression_metrics(
                 cfg["demand_predictions"]
             )
 
-            if dem:
+            rows.append(
+                {
+                    "Vehicle": vehicle,
+                    "Task": "Citywide Demand",
+                    "MAE": dem.get("MAE") if dem else None,
+                    "R²": dem.get("R2") if dem else None,
+                    "Status": (
+                        "Available"
+                        if dem
+                        and dem.get("MAE") is not None
+                        and dem.get("R2") is not None
+                        else "Unavailable"
+                    ),
+                }
+            )
 
-                rows.append(
-                    {
-                        "Vehicle":
-                            vehicle,
-
-                        "Task":
-                            "Citywide Demand",
-
-                        "MAE":
-                            dem.get("MAE"),
-
-                        "R²":
-                            dem.get("R2"),
-                    }
-                )
-
-            # Zone
+            # --------------------------------------------------------------
+            # Task 3 — Zone Demand
+            # --------------------------------------------------------------
             zon = sql_regression_metrics(
                 cfg["zone_demand_predictions"]
             )
 
-            if zon:
-
-                rows.append(
-                    {
-                        "Vehicle":
-                            vehicle,
-
-                        "Task":
-                            "Zone Demand",
-
-                        "MAE":
-                            zon.get("MAE"),
-
-                        "R²":
-                            zon.get("R2"),
-                    }
-                )
-
-        if rows:
-
-            summary = pd.DataFrame(
-                rows
+            rows.append(
+                {
+                    "Vehicle": vehicle,
+                    "Task": "Zone Demand",
+                    "MAE": zon.get("MAE") if zon else None,
+                    "R²": zon.get("R2") if zon else None,
+                    "Status": (
+                        "Available"
+                        if zon
+                        and zon.get("MAE") is not None
+                        and zon.get("R2") is not None
+                        else "Unavailable"
+                    ),
+                }
             )
 
-            st.dataframe(
-                summary.style.format(
-                    {
-                        "MAE":
-                            "{:.2f}",
+        summary = pd.DataFrame(rows)
 
-                        "R²":
-                            "{:.3f}",
-                    }
-                ),
-                use_container_width=True,
-                hide_index=True,
+        # Keep all 12 models visible instead of silently dropping models
+        # whose saved result file is missing.
+        st.dataframe(
+            summary.style.format(
+                {
+                    "MAE": lambda value: (
+                        "N/A"
+                        if pd.isna(value)
+                        else f"{value:.2f}"
+                    ),
+                    "R²": lambda value: (
+                        "N/A"
+                        if pd.isna(value)
+                        else f"{value:.3f}"
+                    ),
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+            height=520,
+        )
+
+        st.caption(
+            "Trip Duration MAE is shown in minutes. "
+            "Citywide and Zone Demand MAE values are shown in their "
+            "respective trip-count units. N/A means the saved evaluation "
+            "result for that model/task is not available."
+        )
+
+        # --------------------------------------------------------------
+        # R² COMPARISON
+        # --------------------------------------------------------------
+        chart_df = summary.dropna(subset=["R²"]).copy()
+
+        if not chart_df.empty:
+            chart_df["Model"] = (
+                chart_df["Vehicle"]
+                + " — "
+                + chart_df["Task"]
             )
-
-            # --------------------------------------------------------------
-            # R2 COMPARISON
-            # --------------------------------------------------------------
 
             fig = px.bar(
-                summary,
-                x="Task",
-                y="R²",
-                color="Vehicle",
-                barmode="group",
-                title=(
-                    "Model R² by Task "
-                    "and Vehicle"
-                ),
-                range_y=[0, 1],
+                chart_df.sort_values("R²"),
+                x="R²",
+                y="Model",
+                orientation="h",
+                range_x=[0, 1],
+                title="R² Comparison — Available Models",
+                labels={
+                    "R²": "R² (higher is better)",
+                    "Model": "",
+                },
+            )
+
+            fig.update_layout(
+                height=560,
+                showlegend=False,
             )
 
             st.plotly_chart(
@@ -2018,20 +2519,28 @@ def page_dashboard():
                 use_container_width=True,
             )
 
-            explanation_box(
-                """
-                R² measures how much of the variation
-                in the target the model explains.
-                Values closer to 1 indicate stronger
-                predictive performance.
-                """
-            )
+            missing_models = summary[
+                summary["R²"].isna()
+            ]["Vehicle"] + " — " + summary[
+                summary["R²"].isna()
+            ]["Task"]
 
-        else:
+            if not missing_models.empty:
+                st.warning(
+                    "The following model results are not plotted because "
+                    "their saved evaluation metrics are unavailable: "
+                    + ", ".join(missing_models.tolist())
+                    + "."
+                )
 
-            st.info(
-                "No trained model results were found."
-            )
+        explanation_box(
+            """
+            R² measures how much of the variation in the target the model
+            explains. Values closer to 1 indicate stronger predictive
+            performance. The chart compares only models with a saved R²;
+            missing results are explicitly listed rather than treated as zero.
+            """
+        )
 
     # ------------------------------------------------------------------------
     # YELLOW TAXI
@@ -2093,6 +2602,69 @@ def page_dashboard():
         dashboard_zone_demand(
             cfg,
             "FHV",
+        )
+
+
+    # ------------------------------------------------------------------------
+    # GREEN TAXI
+    # ------------------------------------------------------------------------
+
+    with tabs[3]:
+
+        cfg = PATHS["Green Taxi"]
+
+        st.header(
+            "🚕 Green Taxi"
+        )
+
+        dashboard_duration(
+            cfg,
+            "Green Taxi",
+        )
+
+        st.divider()
+
+        dashboard_demand(
+            cfg,
+            "Green Taxi",
+        )
+
+        st.divider()
+
+        dashboard_zone_demand(
+            cfg,
+            "Green Taxi",
+        )
+
+    # ------------------------------------------------------------------------
+    # HVFHV
+    # ------------------------------------------------------------------------
+
+    with tabs[4]:
+
+        cfg = PATHS["HVFHV (Uber/Lyft)"]
+
+        st.header(
+            "🚗 High Volume For-Hire Vehicle (Uber/Lyft)"
+        )
+
+        dashboard_duration(
+            cfg,
+            "HVFHV (Uber/Lyft)",
+        )
+
+        st.divider()
+
+        dashboard_demand(
+            cfg,
+            "HVFHV (Uber/Lyft)",
+        )
+
+        st.divider()
+
+        dashboard_zone_demand(
+            cfg,
+            "HVFHV (Uber/Lyft)",
         )
 
 
@@ -2163,7 +2735,7 @@ def main():
 
         ---
 
-        12 trained ML models:
+        12 trained ML models (2025 data only):
 
         • 4 Trip Duration models
 
