@@ -89,7 +89,7 @@ CONFIGS = {
             ROOT
             / "data"
             / "processed"
-            / "fhv_trip_features.parquet",
+            / "fhv_duration_features.parquet",
     },
 }
 
@@ -881,6 +881,16 @@ def run_validation(
     # PHYSICS BASELINE
     # ========================================================
 
+    # FHV trip_distance is estimated from pickup/drop-off taxi-zone
+    # centroids, so this baseline is a reference calculation rather
+    # than a comparison against recorded FHV road distance.
+    if vehicle_name == "FHV":
+        print(
+            "\nNOTE: FHV trip_distance is estimated from taxi-zone "
+            "centroids; the 15 mph baseline is therefore only a "
+            "reference baseline."
+        )
+
     physics_metrics, distance_column = (
         calculate_physics_baseline(
             df_valid,
@@ -1075,11 +1085,17 @@ def run_validation(
         "cv_mae_seconds":
             float(cv_mae),
 
+        "cv_mae_minutes":
+            float(cv_mae / 60.0),
+
         "cv_mae_std_seconds":
             float(cv_mae_std),
 
         "cv_rmse_seconds":
             float(cv_rmse),
+
+        "cv_rmse_minutes":
+            float(cv_rmse / 60.0),
 
         "cv_rmse_std_seconds":
             float(cv_rmse_std),
@@ -1097,11 +1113,25 @@ def run_validation(
                 ]
             ),
 
+        "mean_baseline_mae_minutes":
+            float(
+                baseline_metrics[
+                    "MAE_seconds"
+                ] / 60.0
+            ),
+
         "mean_baseline_rmse_seconds":
             float(
                 baseline_metrics[
                     "RMSE_seconds"
                 ]
+            ),
+
+        "mean_baseline_rmse_minutes":
+            float(
+                baseline_metrics[
+                    "RMSE_seconds"
+                ] / 60.0
             ),
 
         "mean_baseline_r2":
@@ -1290,12 +1320,28 @@ def main():
                     2,
                 ),
 
+            "MAE_minutes":
+                round(
+                    result[
+                        "cv_mae_minutes"
+                    ],
+                    3,
+                ),
+
             "RMSE_seconds":
                 round(
                     result[
                         "cv_rmse_seconds"
                     ],
                     2,
+                ),
+
+            "RMSE_minutes":
+                round(
+                    result[
+                        "cv_rmse_minutes"
+                    ],
+                    3,
                 ),
 
             "R2":
@@ -1476,7 +1522,8 @@ def main():
 
             f.write(
                 f"CV MAE: "
-                f"{result['cv_mae_seconds']:.2f} seconds\n"
+                f"{result['cv_mae_seconds']:.2f} seconds "
+                f"({result['cv_mae_minutes']:.3f} minutes)\n"
             )
 
             f.write(
@@ -1486,7 +1533,8 @@ def main():
 
             f.write(
                 f"CV RMSE: "
-                f"{result['cv_rmse_seconds']:.2f} seconds\n"
+                f"{result['cv_rmse_seconds']:.2f} seconds "
+                f"({result['cv_rmse_minutes']:.3f} minutes)\n"
             )
 
             f.write(
@@ -1601,6 +1649,12 @@ def main():
             f"  {result['vehicle']}: "
             f"{result['validation_status']}"
         )
+
+    print(
+        "\nValidation uses each saved model's own feature_names_in_ "
+        "so Yellow and the new 8-feature FHV model are validated "
+        "against the exact inputs they were trained on."
+    )
 
     print(
         "\nOutput directory:"
