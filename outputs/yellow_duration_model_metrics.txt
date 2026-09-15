@@ -1,0 +1,55 @@
+YELLOW TAXI TRIP DURATION MODEL
+
+Model:
+GradientBoostingRegressor
+
+Split:
+Time-based 80/20
+
+Training rows:
+400,000
+
+Test rows:
+100,000
+
+Training period:
+2025-01-01 00:06:26
+to
+2025-10-21 14:59:42
+
+Test period:
+2025-10-21 15:00:00
+to
+2025-12-31 23:51:47
+
+MAE:
+281.13 seconds
+4.69 minutes
+
+RMSE:
+451.49 seconds
+7.52 minutes
+
+R2:
+0.7833
+
+Within +/- 2 minutes:
+37.14%
+
+Within +/- 5 minutes:
+70.69%
+
+Within +/- 10 minutes:
+88.60%
+
+Actual mean:
+18.61 minutes
+
+Predicted mean:
+18.11 minutes
+
+Actual median:
+13.82 minutes
+
+Predicted median:
+13.76 minutes

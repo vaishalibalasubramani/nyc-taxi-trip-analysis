@@ -1,0 +1,90 @@
+TRIP DURATION MODEL VALIDATION REPORT
+YELLOW TAXI + FHV
+===========================================================================
+
+Vehicle: Yellow Taxi
+---------------------------------------------------------------------------
+Model: outputs\yellow_duration_model.joblib
+Model type: GradientBoostingRegressor
+Data: data\processed\yellow_trip_features.parquet
+Target: trip_duration_s
+Rows validated: 100,000
+Features: 10
+
+Feature names:
+  - trip_distance
+  - passenger_count
+  - PULocationID
+  - DOLocationID
+  - RatecodeID
+  - payment_type
+  - pickup_hour
+  - pickup_dow
+  - is_weekend
+  - pickup_month
+
+CV MAE: 233.73 seconds (3.896 minutes)
+CV MAE std: 1.49 seconds
+CV RMSE: 375.41 seconds (6.257 minutes)
+CV RMSE std: 3.41 seconds
+CV R²: 0.8182
+CV R² std: 0.0030
+
+Mean-duration baseline:
+  MAE: 603.73 seconds
+  RMSE: 880.51 seconds
+  R²: 0.0000
+
+MAE improvement vs baseline: 61.29%
+RMSE improvement vs baseline: 57.36%
+
+15 mph physics baseline:
+  MAE: 451.57 seconds
+  RMSE: 684.99 seconds
+  R²: 0.3948
+
+Validation status: PASS
+
+
+Vehicle: FHV
+---------------------------------------------------------------------------
+Model: outputs\fhv_duration_model.joblib
+Model type: GradientBoostingRegressor
+Data: data\processed\fhv_duration_features.parquet
+Target: trip_duration_s
+Rows validated: 100,000
+Features: 8
+
+Feature names:
+  - trip_distance
+  - PUlocationID
+  - DOlocationID
+  - SR_Flag
+  - pickup_hour
+  - pickup_dow
+  - is_weekend
+  - pickup_month
+
+CV MAE: 622.05 seconds (10.368 minutes)
+CV MAE std: 5.08 seconds
+CV RMSE: 899.46 seconds (14.991 minutes)
+CV RMSE std: 10.05 seconds
+CV R²: 0.5707
+CV R² std: 0.0058
+
+Mean-duration baseline:
+  MAE: 1052.56 seconds
+  RMSE: 1372.77 seconds
+  R²: 0.0000
+
+MAE improvement vs baseline: 40.90%
+RMSE improvement vs baseline: 34.48%
+
+15 mph physics baseline:
+  MAE: 936.12 seconds
+  RMSE: 1302.05 seconds
+  R²: 0.0889
+
+Validation status: PASS
+
+

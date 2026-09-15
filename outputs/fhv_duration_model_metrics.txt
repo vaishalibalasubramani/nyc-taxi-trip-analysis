@@ -1,0 +1,37 @@
+FHV TRIP DURATION MODEL METRICS
+============================================================
+
+Algorithm: GradientBoostingRegressor
+Input: C:\Users\RajkumarMohan\Desktop\nyc-taxi-trip-analysis\nyc-taxi-trip-analysis\data\processed\fhv_duration_features.parquet
+Rows used: 500,000
+
+MODEL PARAMETERS
+------------------------------------------------------------
+n_estimators: 200
+max_depth: 4
+learning_rate: 0.08
+subsample: 0.80
+
+TEST SET PERFORMANCE
+------------------------------------------------------------
+MAE: 10.3220 minutes
+RMSE: 14.9736 minutes
+R2: 0.573750
+
+DURATION STATISTICS
+------------------------------------------------------------
+Actual mean: 32.5577 minutes
+Predicted mean: 32.4962 minutes
+Actual median: 26.7333 minutes
+Predicted median: 29.0800 minutes
+
+FEATURES
+------------------------------------------------------------
+trip_distance
+PUlocationID
+DOlocationID
+SR_Flag
+pickup_hour
+pickup_dow
+is_weekend
+pickup_month

@@ -24,6 +24,7 @@ from datetime import date, time as dtime
 
 import duckdb
 import joblib
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -57,24 +58,36 @@ PATHS = {
         "zone_demand_predictions": OUTPUTS_DIR / "yellow_zone_demand_predictions.parquet",
         "duration_type": "yellow",
         "distance_col": "trip_distance",
+        "duration_metric_unit": "seconds",
     },
 
     # ------------------------------------------------------------------------
     # FHV
     # ------------------------------------------------------------------------
     "FHV": {
+        # FHV demand models continue to use the original demand feature files.
         "trip_features": PROCESSED_DIR / "fhv_trip_features.parquet",
         "hourly_demand": PROCESSED_DIR / "fhv_hourly_demand.parquet",
         "zone_hourly_demand": PROCESSED_DIR / "fhv_zone_hourly_demand.parquet",
+
+        # FHV duration uses the newly simplified 8-feature dataset.
+        "duration_features": PROCESSED_DIR / "fhv_duration_features.parquet",
         "duration_model": OUTPUTS_DIR / "fhv_duration_model.joblib",
         "duration_metrics": OUTPUTS_DIR / "fhv_duration_model_metrics.txt",
         "duration_predictions": OUTPUTS_DIR / "fhv_duration_predictions.parquet",
+
         "demand_model": OUTPUTS_DIR / "fhv_demand_model.joblib",
         "demand_predictions": OUTPUTS_DIR / "fhv_demand_predictions.parquet",
         "zone_demand_model": OUTPUTS_DIR / "fhv_zone_demand_model.joblib",
         "zone_demand_predictions": OUTPUTS_DIR / "fhv_zone_demand_predictions.parquet",
         "duration_type": "fhv",
-        "distance_col": "trip_distance",
+
+        # Standard FHV has no recorded trip_distance field.
+        # The duration model uses an estimated trip_distance calculated
+        # from pickup/drop-off taxi-zone centroids.
+        "distance_col": None,
+        # FHV duration metrics are saved by the FHV trainer in minutes.
+        "duration_metric_unit": "minutes",
     },
 
     # ------------------------------------------------------------------------
@@ -93,6 +106,7 @@ PATHS = {
         "zone_demand_predictions": OUTPUTS_DIR / "zone_demand_predictions.parquet",
         "duration_type": "green",
         "distance_col": "trip_distance",
+        "duration_metric_unit": "seconds",
     },
 
     # ------------------------------------------------------------------------
@@ -111,6 +125,7 @@ PATHS = {
         "zone_demand_predictions": OUTPUTS_DIR / "hvfhv_zone_demand_predictions.parquet",
         "duration_type": "hvfhv",
         "distance_col": "trip_miles",
+        "duration_metric_unit": "seconds",
     },
 }
 
@@ -131,6 +146,43 @@ def load_model(path: Path):
     return joblib.load(path)
 
 
+
+class _DuckDBQueryResult:
+    """Small compatibility wrapper around a fresh DuckDB connection.
+
+    The dashboard previously used _duckdb_sql(), which relies on DuckDB's
+    process-global connection. Streamlit reruns can leave a pending/closed
+    result behind. Each query now gets its own connection and is closed only
+    after .df()/.fetchone() has consumed the result.
+    """
+
+    def __init__(self, sql: str):
+        self._con = duckdb.connect(database=":memory:")
+        self._result = None
+        try:
+            self._result = self._con.execute(sql)
+        except Exception:
+            self._con.close()
+            raise
+
+    def df(self):
+        try:
+            return self._result.df()
+        finally:
+            self._con.close()
+
+    def fetchone(self):
+        try:
+            return self._result.fetchone()
+        finally:
+            self._con.close()
+
+
+def _duckdb_sql(sql: str) -> _DuckDBQueryResult:
+    """Execute one SQL statement on an isolated DuckDB connection."""
+    return _DuckDBQueryResult(sql)
+
+
 @st.cache_data(show_spinner=False)
 def load_zone_list(zone_path: Path):
 
@@ -139,7 +191,7 @@ def load_zone_list(zone_path: Path):
             columns=["zone_id", "zone_name", "borough"]
         )
 
-    return duckdb.sql(
+    return _duckdb_sql(
         f"""
         SELECT DISTINCT
             zone_id,
@@ -158,7 +210,7 @@ def load_hourly_series(hourly_path: Path):
     if not hourly_path.exists():
         return pd.Series(dtype="float64")
 
-    df = duckdb.sql(
+    df = _duckdb_sql(
         f"""
         SELECT
             pickup_hour_ts,
@@ -183,7 +235,7 @@ def load_zone_series(zone_path: Path, zone_id: int):
     if not zone_path.exists():
         return pd.Series(dtype="float64")
 
-    df = duckdb.sql(
+    df = _duckdb_sql(
         f"""
         SELECT
             pickup_hour_ts,
@@ -216,7 +268,7 @@ def load_full_zone_lookup(zone_hourly_demand_path: Path) -> pd.DataFrame:
     if not zone_hourly_demand_path.exists():
         return pd.DataFrame(columns=["zone_id", "zone_name", "borough"])
     try:
-        return duckdb.sql(
+        return _duckdb_sql(
             f"""
             SELECT LocationID AS zone_id, Zone AS zone_name, Borough AS borough
             FROM read_csv_auto('{TAXI_ZONE_LOOKUP_URL}')
@@ -236,7 +288,7 @@ def load_zone_pair_distance_stats(
         return pd.DataFrame(
             columns=["PULocationID", "DOLocationID", "avg_trip_distance", "trip_count"]
         )
-    return duckdb.sql(
+    return _duckdb_sql(
         f"""
         SELECT PULocationID, DOLocationID,
                avg({distance_col}) AS avg_trip_distance,
@@ -261,7 +313,7 @@ def load_borough_pair_distance_stats(
                 "avg_trip_distance", "trip_count"
             ]
         )
-    return duckdb.sql(
+    return _duckdb_sql(
         f"""
         WITH zones AS (
             SELECT DISTINCT zone_id, borough
@@ -288,7 +340,7 @@ def load_overall_avg_trip_distance(
 ) -> float:
     if not trip_features_path.exists():
         return 3.0
-    result = duckdb.sql(
+    result = _duckdb_sql(
         f"SELECT avg({distance_col}) FROM read_parquet('{trip_features_path.as_posix()}')"
     ).fetchone()
     return float(result[0]) if result and result[0] is not None else 3.0
@@ -371,7 +423,7 @@ def resolve_trip_distance(
 def load_data_date_range(hourly_demand_path: Path) -> tuple:
     if not hourly_demand_path.exists():
         return YEAR_START, YEAR_END
-    row = duckdb.sql(
+    row = _duckdb_sql(
         f"""
         SELECT min(pickup_hour_ts), max(pickup_hour_ts)
         FROM read_parquet('{hourly_demand_path.as_posix()}')
@@ -668,8 +720,13 @@ def duration_metrics_with_fallback(
         return metrics
 
     try:
-        row = duckdb.sql(
-            f"""
+        # Use a dedicated DuckDB connection for this query. Streamlit can
+        # rerun dashboard sections while another DuckDB relation is still
+        # pending on the global connection, which can cause:
+        # InvalidInputException: unsuccessful or closed pending query result.
+        with duckdb.connect(database=":memory:") as con:
+            row = con.execute(
+                f"""
             WITH p AS (
                 SELECT
                     actual,
@@ -705,8 +762,8 @@ def duration_metrics_with_fallback(
                         )
                 END AS r2
             FROM p
-            """
-        ).fetchone()
+                """
+            ).fetchone()
 
         if row and any(value is not None for value in row):
             fallback = {
@@ -728,66 +785,49 @@ def duration_metrics_with_fallback(
 
 
 def sql_regression_metrics(predictions_path: Path):
+    """Calculate MAE, RMSE and R² from a saved prediction parquet.
 
+    Pandas is intentionally used here instead of DuckDB so the model
+    performance page cannot fail because of a stale/pending DuckDB result
+    during a Streamlit rerun.
+    """
     if not predictions_path.exists():
         return {}
 
-    row = duckdb.sql(
-        f"""
-        WITH p AS (
-            SELECT
-                actual,
-                predicted
-            FROM read_parquet(
-                '{predictions_path.as_posix()}'
-            )
-        ),
-
-        stats AS (
-            SELECT
-                avg(actual) AS mean_actual
-            FROM p
+    try:
+        df = pd.read_parquet(
+            predictions_path,
+            columns=["actual", "predicted"],
         )
-
-        SELECT
-
-            avg(
-                abs(actual - predicted)
-            ) AS mae,
-
-            sqrt(
-                avg(
-                    power(actual - predicted, 2)
-                )
-            ) AS rmse,
-
-            1 -
-
-            sum(
-                power(actual - predicted, 2)
-            )
-
-            /
-
-            sum(
-                power(
-                    actual -
-                    (SELECT mean_actual FROM stats),
-                    2
-                )
-            ) AS r2
-
-        FROM p
-        """
-    ).fetchone()
-
-    if row is None:
+    except Exception:
         return {}
 
+    if df.empty:
+        return {}
+
+    actual = pd.to_numeric(df["actual"], errors="coerce").to_numpy(dtype=float)
+    predicted = pd.to_numeric(df["predicted"], errors="coerce").to_numpy(dtype=float)
+
+    mask = np.isfinite(actual) & np.isfinite(predicted)
+    actual = actual[mask]
+    predicted = predicted[mask]
+
+    if actual.size == 0:
+        return {}
+
+    error = actual - predicted
+    mae = float(np.mean(np.abs(error)))
+    rmse = float(np.sqrt(np.mean(np.square(error))))
+
+    denominator = float(np.sum(np.square(actual - np.mean(actual))))
+    r2 = float(
+        1.0 - np.sum(np.square(error)) / denominator
+    ) if denominator > 0 else float("nan")
+
     return {
-        "MAE": row[0],
-        "RMSE": row[1],
-        "R2": row[2],
+        "MAE": mae,
+        "RMSE": rmse,
+        "R2": r2,
     }
 
 
@@ -799,26 +839,80 @@ def actual_vs_predicted_duration_chart(predictions_path: Path, vehicle: str):
     """
     Build the actual-vs-predicted trip-duration line chart from the saved
     test-set predictions parquet. Returns None if unavailable.
+
+    FHV prediction files can contain the explicit duration columns saved by
+    the simplified FHV trainer (in seconds and minutes). The other duration
+    prediction files use ``actual`` and ``predicted`` in seconds.
     """
     if not predictions_path.exists():
         return None
 
-    duration_df = duckdb.sql(
-        f"""
-        SELECT *
-        FROM read_parquet('{predictions_path.as_posix()}')
-        """
-    ).df()
-
-    if (
-        duration_df.empty
-        or "actual" not in duration_df.columns
-        or "predicted" not in duration_df.columns
-    ):
+    try:
+        duration_df = pd.read_parquet(predictions_path)
+    except Exception:
         return None
 
-    duration_df["actual_minutes"] = duration_df["actual"] / 60.0
-    duration_df["predicted_minutes"] = duration_df["predicted"] / 60.0
+    if duration_df.empty:
+        return None
+
+    # ------------------------------------------------------------------------
+    # FHV: use the explicit columns written by train_duration_fhv_simple.py.
+    # Prefer the already-converted minute columns. If an older FHV prediction
+    # file only has the second columns, convert those to minutes here.
+    # ------------------------------------------------------------------------
+    if vehicle == "FHV":
+        if (
+            "actual_duration_minutes" in duration_df.columns
+            and "predicted_duration_minutes" in duration_df.columns
+        ):
+            duration_df["actual_minutes"] = pd.to_numeric(
+                duration_df["actual_duration_minutes"], errors="coerce"
+            )
+            duration_df["predicted_minutes"] = pd.to_numeric(
+                duration_df["predicted_duration_minutes"], errors="coerce"
+            )
+        elif (
+            "actual_duration_s" in duration_df.columns
+            and "predicted_duration_s" in duration_df.columns
+        ):
+            duration_df["actual_minutes"] = pd.to_numeric(
+                duration_df["actual_duration_s"], errors="coerce"
+            ) / 60.0
+            duration_df["predicted_minutes"] = pd.to_numeric(
+                duration_df["predicted_duration_s"], errors="coerce"
+            ) / 60.0
+        elif "actual" in duration_df.columns and "predicted" in duration_df.columns:
+            # Compatibility with an older FHV prediction file where the
+            # generic columns were stored in seconds.
+            duration_df["actual_minutes"] = pd.to_numeric(
+                duration_df["actual"], errors="coerce"
+            ) / 60.0
+            duration_df["predicted_minutes"] = pd.to_numeric(
+                duration_df["predicted"], errors="coerce"
+            ) / 60.0
+        else:
+            return None
+
+    # ------------------------------------------------------------------------
+    # Yellow / Green / HVFHV: prediction files store actual/predicted in
+    # seconds. Leave these models exactly as they were.
+    # ------------------------------------------------------------------------
+    elif "actual" in duration_df.columns and "predicted" in duration_df.columns:
+        duration_df["actual_minutes"] = pd.to_numeric(
+            duration_df["actual"], errors="coerce"
+        ) / 60.0
+        duration_df["predicted_minutes"] = pd.to_numeric(
+            duration_df["predicted"], errors="coerce"
+        ) / 60.0
+    else:
+        return None
+
+    duration_df = duration_df.dropna(
+        subset=["actual_minutes", "predicted_minutes"]
+    )
+
+    if duration_df.empty:
+        return None
 
     chart_df = duration_df.head(5000).copy()
     chart_df["Trip"] = range(1, len(chart_df) + 1)
@@ -862,7 +956,7 @@ def actual_vs_predicted_series_chart(
     if not predictions_path.exists():
         return None
 
-    df = duckdb.sql(
+    df = _duckdb_sql(
         f"""
         SELECT *
         FROM read_parquet('{predictions_path.as_posix()}')
@@ -893,27 +987,162 @@ def actual_vs_predicted_series_chart(
     return fig
 
 
-def highlight_point_on_chart(fig: go.Figure, x_value, y_value, label: str):
-    """Overlay a single marker (this prediction) on an existing chart."""
-    fig.add_trace(
-        go.Scatter(
-            x=[x_value],
-            y=[y_value],
-            mode="markers",
-            name=label,
-            marker=dict(size=14, symbol="star", color="red"),
-        )
-    )
-    return fig
-
-
 # ============================================================================
 # PAGE 1 — PREDICT
 # ============================================================================
 
+
 # ----------------------------------------------------------------------------
-# TASK 1 — TRIP DURATION
+# FHV DURATION DISTANCE SUPPORT
 # ----------------------------------------------------------------------------
+
+FHV_CENTROIDS_PATH = ROOT / "data" / "reference" / "taxi_zone_centroids.csv"
+
+
+@st.cache_data(show_spinner=False)
+def load_fhv_zone_centroids() -> pd.DataFrame:
+    """
+    Load the 263 NYC taxi-zone centroids created by
+    build_fhv_duration_features.py.
+
+    Standard FHV records do not have a recorded trip-distance field.
+    The simplified FHV duration model estimates trip_distance using
+    the great-circle distance between pickup and drop-off taxi-zone
+    centroids.
+    """
+    if not FHV_CENTROIDS_PATH.exists():
+        return pd.DataFrame(
+            columns=[
+                "LocationID",
+                "zone_latitude",
+                "zone_longitude",
+            ]
+        )
+
+    try:
+        df = pd.read_csv(FHV_CENTROIDS_PATH)
+
+        required = {
+            "LocationID",
+            "zone_latitude",
+            "zone_longitude",
+        }
+
+        if not required.issubset(df.columns):
+            return pd.DataFrame(
+                columns=[
+                    "LocationID",
+                    "zone_latitude",
+                    "zone_longitude",
+                ]
+            )
+
+        df = df[
+            [
+                "LocationID",
+                "zone_latitude",
+                "zone_longitude",
+            ]
+        ].copy()
+
+        df["LocationID"] = pd.to_numeric(
+            df["LocationID"],
+            errors="coerce",
+        )
+
+        df["zone_latitude"] = pd.to_numeric(
+            df["zone_latitude"],
+            errors="coerce",
+        )
+
+        df["zone_longitude"] = pd.to_numeric(
+            df["zone_longitude"],
+            errors="coerce",
+        )
+
+        df = df.dropna().drop_duplicates(
+            subset=["LocationID"]
+        )
+
+        df["LocationID"] = df["LocationID"].astype(int)
+
+        return df
+
+    except Exception:
+        return pd.DataFrame(
+            columns=[
+                "LocationID",
+                "zone_latitude",
+                "zone_longitude",
+            ]
+        )
+
+
+def haversine_miles_scalar(
+    lat1: float,
+    lon1: float,
+    lat2: float,
+    lon2: float,
+) -> float:
+    """Calculate great-circle distance between two coordinates in miles."""
+
+    lat1_rad = np.radians(float(lat1))
+    lon1_rad = np.radians(float(lon1))
+    lat2_rad = np.radians(float(lat2))
+    lon2_rad = np.radians(float(lon2))
+
+    dlat = lat2_rad - lat1_rad
+    dlon = lon2_rad - lon1_rad
+
+    a = (
+        np.sin(dlat / 2.0) ** 2
+        + np.cos(lat1_rad)
+        * np.cos(lat2_rad)
+        * np.sin(dlon / 2.0) ** 2
+    )
+
+    a = float(np.clip(a, 0.0, 1.0))
+
+    c = 2.0 * np.arcsin(np.sqrt(a))
+
+    return float(3958.7613 * c)
+
+
+def get_fhv_trip_distance(
+    pu_id: int,
+    do_id: int,
+) -> float | None:
+    """
+    Estimate FHV trip distance in miles from pickup/drop-off
+    taxi-zone centroids.
+
+    Standard FHV records do not contain a recorded trip-distance
+    field. The simplified FHV duration model was trained with this
+    estimated `trip_distance` feature.
+    """
+    centroids = load_fhv_zone_centroids()
+
+    if centroids.empty:
+        return None
+
+    pu = centroids[
+        centroids["LocationID"] == int(pu_id)
+    ]
+
+    do = centroids[
+        centroids["LocationID"] == int(do_id)
+    ]
+
+    if pu.empty or do.empty:
+        return None
+
+    return haversine_miles_scalar(
+        float(pu.iloc[0]["zone_latitude"]),
+        float(pu.iloc[0]["zone_longitude"]),
+        float(do.iloc[0]["zone_latitude"]),
+        float(do.iloc[0]["zone_longitude"]),
+    )
+
 
 def get_duration_reference(
     vehicle: str,
@@ -922,39 +1151,61 @@ def get_duration_reference(
     pickup_date: date,
     pickup_hour: int,
 ):
-    """Return the route distance used for models that require distance.
-
-    Green and Yellow use their own historical trip data. HVFHV uses its own
-    trip_miles when the model expects it. FHV has no distance field, so its
-    display-only distance is estimated from Yellow Taxi history.
     """
-    cfg = PATHS[vehicle]
+    Return a display-only historical route-distance reference.
 
-    # FHV has no trip-distance field.
-    source_vehicle = "Yellow Taxi" if vehicle == "FHV" else vehicle
-    source_cfg = PATHS[source_vehicle]
+    Yellow/Green/HVFHV can use their actual distance fields.
+    FHV distance is handled separately by get_fhv_trip_distance().
+    """
+
+    if vehicle == "FHV":
+        return None
+
+    source_cfg = PATHS[vehicle]
     trip_features = source_cfg["trip_features"]
     distance_col = source_cfg["distance_col"]
 
-    if not trip_features.exists():
+    if distance_col is None or not trip_features.exists():
         return None
 
-    # Use the same robust three-tier route resolution used by Vaihali's
-    # Green/HVFHV dashboard.
     try:
-        zone_pair_stats = load_zone_pair_distance_stats(trip_features, distance_col)
+        zone_pair_stats = load_zone_pair_distance_stats(
+            trip_features,
+            distance_col,
+        )
+
         borough_pair_stats = load_borough_pair_distance_stats(
             trip_features,
             source_cfg["zone_hourly_demand"],
             distance_col,
         )
 
-        zones = load_full_zone_lookup(source_cfg["zone_hourly_demand"])
-        borough_map = dict(zip(zones["zone_id"], zones["borough"]))
-        pu_borough = borough_map.get(pu_id, "Unknown")
-        do_borough = borough_map.get(do_id, "Unknown")
+        zones = load_full_zone_lookup(
+            source_cfg["zone_hourly_demand"]
+        )
 
-        overall_avg = load_overall_avg_trip_distance(trip_features, distance_col)
+        borough_map = dict(
+            zip(
+                zones["zone_id"],
+                zones["borough"],
+            )
+        )
+
+        pu_borough = borough_map.get(
+            pu_id,
+            "Unknown",
+        )
+
+        do_borough = borough_map.get(
+            do_id,
+            "Unknown",
+        )
+
+        overall_avg = load_overall_avg_trip_distance(
+            trip_features,
+            distance_col,
+        )
+
         resolution = resolve_trip_distance(
             pu_id,
             do_id,
@@ -964,16 +1215,24 @@ def get_duration_reference(
             borough_pair_stats,
             overall_avg,
         )
+
         return {
-            "distance": float(resolution["distance"]),
+            "distance": float(
+                resolution["distance"]
+            ),
             "source": resolution["tier"],
             "note": resolution["note"],
             "resolution": resolution,
             "distance_col": distance_col,
         }
+
     except Exception:
         return None
 
+
+# ----------------------------------------------------------------------------
+# TASK 1 — TRIP DURATION
+# ----------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
 def load_top_pickup_zones(zone_path: Path, limit: int = 10) -> pd.DataFrame:
@@ -984,7 +1243,7 @@ def load_top_pickup_zones(zone_path: Path, limit: int = 10) -> pd.DataFrame:
         )
 
     try:
-        return duckdb.sql(
+        return _duckdb_sql(
             f"""
             SELECT
                 zone_id,
@@ -1093,8 +1352,8 @@ def vehicle_focus_section(vehicle: str, cfg: dict):
 def predict_duration_tab():
     st.subheader("Trip Duration Prediction")
     st.caption(
-        "Predict the expected trip duration using the trained model for the "
-        "selected vehicle type."
+        "Predict the expected trip duration using the trained "
+        "GradientBoostingRegressor for the selected vehicle type."
     )
 
     vehicle = st.selectbox(
@@ -1102,28 +1361,47 @@ def predict_duration_tab():
         list(PATHS.keys()),
         key="duration_vehicle",
     )
+
     cfg = PATHS[vehicle]
-    model = load_model(cfg["duration_model"])
+
+    model = load_model(
+        cfg["duration_model"]
+    )
 
     if model is None:
-        st.error(f"Model not found:\n\n{cfg['duration_model']}")
+        st.error(
+            f"Model not found:\n\n{cfg['duration_model']}"
+        )
         return
 
-    # Full TLC lookup so legitimate drop-off-only zones remain selectable.
-    zones = load_full_zone_lookup(cfg["zone_hourly_demand"])
+    # Full TLC lookup so all legitimate taxi zones remain selectable.
+    zones = load_full_zone_lookup(
+        cfg["zone_hourly_demand"]
+    )
+
     if zones.empty:
         st.error(
-            "Zone data was not found. Please make sure the feature-building "
-            "step has been completed."
+            "Zone data was not found. Please make sure the "
+            "feature-building step has been completed."
         )
         return
 
     zone_options = {}
-    for row in zones.itertuples():
-        label = f"{row.zone_name} ({row.borough}) -- #{row.zone_id}"
-        zone_options[label] = int(row.zone_id)
 
-    min_date, max_date = load_data_date_range(cfg["hourly_demand"])
+    for row in zones.itertuples():
+        label = (
+            f"{row.zone_name} "
+            f"({row.borough}) "
+            f"-- #{row.zone_id}"
+        )
+
+        zone_options[label] = int(
+            row.zone_id
+        )
+
+    min_date, max_date = load_data_date_range(
+        cfg["hourly_demand"]
+    )
 
     with st.form("duration_prediction_form"):
         c1, c2 = st.columns(2)
@@ -1133,6 +1411,7 @@ def predict_duration_tab():
                 "Pickup zone",
                 list(zone_options.keys()),
             )
+
             pickup_date = st.date_input(
                 "Pickup date",
                 value=min_date,
@@ -1144,11 +1423,18 @@ def predict_duration_tab():
             dropoff_label = st.selectbox(
                 "Drop-off zone",
                 list(zone_options.keys()),
-                index=min(1, len(zone_options) - 1),
+                index=min(
+                    1,
+                    len(zone_options) - 1,
+                ),
             )
+
             pickup_time = st.time_input(
                 "Pickup time",
-                value=dtime(hour=9, minute=0),
+                value=dtime(
+                    hour=9,
+                    minute=0,
+                ),
             )
 
         submitted = st.form_submit_button(
@@ -1161,30 +1447,98 @@ def predict_duration_tab():
 
     pu_id = zone_options[pickup_label]
     do_id = zone_options[dropoff_label]
-    same_zone = pu_id == do_id
-    dow = duckdb_dow(pickup_date)
-    pickup_hour = pickup_time.hour
 
-    reference = get_duration_reference(
-        vehicle,
-        pu_id,
-        do_id,
-        pickup_date,
-        pickup_hour,
+    same_zone = (
+        pu_id == do_id
     )
 
-    # Build only features appropriate to the selected model. Any additional
-    # model-specific feature not collected by this simple form is safely
-    # defaulted by build_feature_row().
+    dow = duckdb_dow(
+        pickup_date
+    )
+
+    pickup_hour = pickup_time.hour
+
+    # ------------------------------------------------------------------------
+    # Common temporal features
+    # ------------------------------------------------------------------------
+
+    is_weekend = (
+        1 if dow in (0, 6) else 0
+    )
+
+    is_rush_hour = (
+        1
+        if pickup_hour in (7, 8, 9, 16, 17, 18)
+        else 0
+    )
+
+    is_overnight = (
+        1
+        if 0 <= pickup_hour <= 5
+        else 0
+    )
+
+    # Cyclic encoding used by the simplified FHV duration model.
+    #
+    # 24-hour cycle:
+    #   sin/cos keep 23:00 and 00:00 close together.
+    #
+    # 7-day cycle:
+    #   sin/cos keep Saturday and Sunday close together.
+    hour_angle = (
+        2.0
+        * np.pi
+        * pickup_hour
+        / 24.0
+    )
+
+    dow_angle = (
+        2.0
+        * np.pi
+        * dow
+        / 7.0
+    )
+
+    # ------------------------------------------------------------------------
+    # Build the model input
+    # ------------------------------------------------------------------------
+
     known = {
+        # Yellow/Green/HVFHV-compatible IDs
         "PULocationID": pu_id,
         "DOLocationID": do_id,
+
+        # FHV-compatible IDs
         "PUlocationID": pu_id,
         "DOlocationID": do_id,
+
         "pickup_hour": pickup_hour,
         "pickup_dow": dow,
-        "is_weekend": 1 if dow in (0, 6) else 0,
         "pickup_month": pickup_date.month,
+        "is_weekend": is_weekend,
+
+        # FHV temporal features
+        "is_rush_hour": is_rush_hour,
+        "is_overnight": is_overnight,
+
+        # FHV route feature
+        "same_zone": int(same_zone),
+
+        # FHV cyclic features
+        "pickup_hour_sin": float(
+            np.sin(hour_angle)
+        ),
+        "pickup_hour_cos": float(
+            np.cos(hour_angle)
+        ),
+        "pickup_dow_sin": float(
+            np.sin(dow_angle)
+        ),
+        "pickup_dow_cos": float(
+            np.cos(dow_angle)
+        ),
+
+        # Existing model defaults where applicable
         "passenger_count": 1,
         "RatecodeID": 1,
         "payment_type": 1,
@@ -1195,103 +1549,223 @@ def predict_duration_tab():
         "is_wav_request": 0,
     }
 
-    # Distance is a model input for Yellow/Green. For FHV it is display-only.
-    if reference is not None:
-        known[reference["distance_col"]] = reference["distance"]
+    # ------------------------------------------------------------------------
+    # Distance feature
+    #
+    # Yellow / Green / HVFHV:
+    #   use their recorded/historical trip-distance field.
+    #
+    # FHV:
+    #   standard FHV records do not contain recorded trip distance.
+    #   The new FHV duration model uses `trip_distance`, estimated from
+    #   pickup/drop-off taxi-zone centroids using Haversine distance.
+    # ------------------------------------------------------------------------
 
-    X, defaulted = build_feature_row(model, known)
+    if vehicle == "FHV":
+        fhv_trip_distance = get_fhv_trip_distance(
+            pu_id,
+            do_id,
+        )
+
+        if fhv_trip_distance is None:
+            st.error(
+                "FHV taxi-zone centroid information is unavailable. "
+                "Expected file:\n\n"
+                f"{FHV_CENTROIDS_PATH}"
+            )
+            return
+
+        known["trip_distance"] = float(
+            fhv_trip_distance
+        )
+
+    # ------------------------------------------------------------------------
+    # Distance for Yellow / Green / HVFHV
+    # ------------------------------------------------------------------------
+
+    reference = get_duration_reference(
+        vehicle,
+        pu_id,
+        do_id,
+        pickup_date,
+        pickup_hour,
+    )
+
+    if (
+        reference is not None
+        and reference["distance_col"] is not None
+    ):
+        known[
+            reference["distance_col"]
+        ] = reference["distance"]
+
+    # ------------------------------------------------------------------------
+    # Build columns in exactly the order expected by the saved model.
+    # ------------------------------------------------------------------------
+
+    X, defaulted = build_feature_row(
+        model,
+        known,
+    )
 
     try:
         prediction_seconds = max(
             0.0,
-            float(model.predict(X)[0]),
+            float(
+                model.predict(X)[0]
+            ),
         )
+
     except Exception as exc:
         st.error(
-            "The selected model could not make a prediction from the "
-            f"constructed feature row: {exc}"
+            "The selected model could not make a prediction "
+            "from the constructed feature row:\n\n"
+            f"{exc}"
         )
-        with st.expander("Show model input"):
-            st.dataframe(X, use_container_width=True)
+
+        with st.expander(
+            "Show model input"
+        ):
+            st.dataframe(
+                X,
+                use_container_width=True,
+            )
+
         return
 
-    prediction_minutes = prediction_seconds / 60.0
+    prediction_minutes = (
+        prediction_seconds / 60.0
+    )
 
     st.divider()
 
-    # Same-zone trips: show only the informational message.
-    # Do not display trip duration or trip distance for this case.
+    # ------------------------------------------------------------------------
+    # SAME-ZONE INFORMATION
+    # ------------------------------------------------------------------------
+
     if same_zone:
         st.info(
             f"📍 **Same zone trip** — pickup and drop-off are both "
-            f"**{pickup_label}**. The model is predicting a trip that "
-            f"starts and ends within the same taxi zone."
+            f"**{pickup_label}**."
         )
-        return
 
-    st.caption(
-        f"Route type: **Different zones** — "
-        f"{pickup_label} → {dropoff_label}"
-    )
-
-    c1, c2 = st.columns(2)
-    c1.metric(
-        "Predicted duration",
-        format_duration_minutes(prediction_seconds),
-    )
-
-    if reference is not None:
-        c2.metric(
-            "Trip distance",
-            f"{reference['distance']:.1f} miles",
-        )
-        if vehicle == "FHV":
-            st.caption(
-                "Distance is shown for reference only because FHV trip records "
-                "do not contain trip distance."
-            )
-        elif reference["source"] != "exact_pair":
-            st.caption(
-                f"Distance estimated using {reference['source'].replace('_', ' ')} "
-                "historical data."
-            )
     else:
-        c2.metric("Trip distance", "Not available")
+        st.caption(
+            f"Route type: **Different zones** — "
+            f"{pickup_label} → {dropoff_label}"
+        )
 
-    with st.expander("Show model input"):
-        st.dataframe(X, use_container_width=True)
+    # ------------------------------------------------------------------------
+    # RESULTS
+    # ------------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-    # ACTUAL VS PREDICTED — every prediction gets a chart, since Oct/Nov/
-    # Dec pickup dates fall in the held-out test period for these models.
-    # ------------------------------------------------------------------
+    # For a same-zone selection, do not show a duration or distance result.
+    # The route message above is enough to explain the selection and avoids
+    # presenting a misleading non-zero distance/duration for an identical
+    # pickup/drop-off zone.
+    if not same_zone:
+
+        c1, c2 = st.columns(2)
+
+        c1.metric(
+            "Predicted duration",
+            format_duration_minutes(
+                prediction_seconds
+            ),
+        )
+
+        if vehicle == "FHV":
+            c2.metric(
+                "Trip distance",
+                f"{known['trip_distance']:.2f} miles",
+            )
+
+            st.caption(
+                "FHV trip distance is estimated from the straight-line "
+                "Haversine distance between the pickup and drop-off "
+                "taxi-zone centroids because standard FHV records do not "
+                "contain a recorded trip-distance field."
+            )
+
+        elif reference is not None:
+            c2.metric(
+                "Trip distance",
+                f"{reference['distance']:.1f} miles",
+            )
+
+            if reference["source"] != "exact_pair":
+                st.caption(
+                    f"Distance estimated using "
+                    f"{reference['source'].replace('_', ' ')} "
+                    "historical data."
+                )
+
+        else:
+            c2.metric(
+                "Trip distance",
+                "Not available",
+            )
+
+    # ------------------------------------------------------------------------
+    # MODEL INPUT
+    # ------------------------------------------------------------------------
+
+    with st.expander(
+        "Show model input"
+    ):
+        st.dataframe(
+            X,
+            use_container_width=True,
+        )
+
+    if defaulted:
+        st.warning(
+            "Some model features were not supplied and were "
+            "defaulted to 0: "
+            + ", ".join(
+                f"`{x}`"
+                for x in defaulted
+            )
+        )
+
+    # ------------------------------------------------------------------------
+    # ACTUAL VS PREDICTED
+    # ------------------------------------------------------------------------
+
     st.divider()
-    st.markdown("#### How this prediction compares to the test set")
+
+    st.markdown(
+        "#### How this prediction compares to the test set"
+    )
 
     dur_fig = actual_vs_predicted_duration_chart(
-        cfg["duration_predictions"], vehicle
+        cfg["duration_predictions"],
+        vehicle,
     )
+
     if dur_fig is not None:
-        highlight_point_on_chart(
+
+        st.plotly_chart(
             dur_fig,
-            x_value=1,
-            y_value=prediction_minutes,
-            label="This prediction",
-        )
-        st.plotly_chart(dur_fig, use_container_width=True)
-        st.caption(
-            "The line chart shows actual vs. predicted duration across the "
-            "model's saved test trips. The red star marks this prediction's "
-            "duration for reference, not its exact position in the test set."
-        )
-    else:
-        st.info(
-            "Saved test-set predictions were not found for this vehicle, "
-            "so an actual-vs-predicted comparison chart can't be shown."
+            use_container_width=True,
         )
 
-    # Vehicle-specific concentration analysis.
-    # This updates automatically when the user changes Vehicle type.
+        st.caption(
+            "The chart shows actual vs. predicted duration "
+            "across the model's saved test trips."
+        )
+
+    else:
+        st.info(
+            "Saved test-set predictions were not found for this "
+            "vehicle, so an actual-vs-predicted comparison chart "
+            "cannot be shown."
+        )
+
+    # ------------------------------------------------------------------------
+    # VEHICLE-SPECIFIC CONCENTRATION ANALYSIS
+    # ------------------------------------------------------------------------
+
     vehicle_focus_section(
         vehicle,
         cfg,
@@ -1487,17 +1961,10 @@ def predict_citywide_demand_tab():
         y_title="Trips / hour",
     )
     if demand_fig is not None:
-        highlight_point_on_chart(
-            demand_fig,
-            x_value=target_ts,
-            y_value=prediction,
-            label="This prediction",
-        )
         st.plotly_chart(demand_fig, use_container_width=True)
         st.caption(
             "The line chart shows actual vs. predicted citywide demand "
-            "across the model's saved test hours. The red star marks this "
-            "prediction's value at the selected forecast time."
+            "across the model's saved test hours."
         )
     else:
         st.info(
@@ -1723,7 +2190,7 @@ def predict_zone_demand_tab():
 
     if zone_pred_path.exists():
         try:
-            zone_pred_df = duckdb.sql(
+            zone_pred_df = _duckdb_sql(
                 f"""
                 SELECT pickup_hour_ts, actual, predicted
                 FROM read_parquet('{zone_pred_path.as_posix()}')
@@ -1770,17 +2237,10 @@ def predict_zone_demand_tab():
         )
 
     if zone_fig is not None:
-        highlight_point_on_chart(
-            zone_fig,
-            x_value=target_ts,
-            y_value=prediction,
-            label="This prediction",
-        )
         st.plotly_chart(zone_fig, use_container_width=True)
         st.caption(
             "The line chart shows actual vs. predicted demand for this zone "
-            "across the model's saved test hours. The red star marks this "
-            "prediction's value at the selected forecast time."
+            "across the model's saved test hours."
         )
     else:
         st.info(
@@ -1845,6 +2305,20 @@ def explanation_box(text: str):
     )
 
 
+def duration_metric_minutes(value, vehicle: str) -> float | None:
+    """Return a saved duration metric in minutes.
+
+    Yellow/Green/HVFHV metric files store duration errors in seconds.
+    The simplified FHV trainer stores MAE/RMSE directly in minutes.
+    Keeping the unit explicit prevents the FHV values from being divided
+    by 60 a second time.
+    """
+    if value is None:
+        return None
+    unit = PATHS.get(vehicle, {}).get("duration_metric_unit", "seconds")
+    return float(value) if unit == "minutes" else float(value) / 60.0
+
+
 # ============================================================================
 # TASK 1 PERFORMANCE
 # ============================================================================
@@ -1865,7 +2339,7 @@ def dashboard_duration(
         st.info("Duration metrics were not found.")
         return
 
-    # Metrics are stored internally in seconds.
+    # Convert each model's saved duration metric to minutes using its recorded unit.
     mae = metrics.get("MAE")
     rmse = metrics.get("RMSE")
     r2 = metrics.get("R2")
@@ -1874,13 +2348,13 @@ def dashboard_duration(
 
     c1.metric(
         "MAE",
-        f"{mae / 60.0:.1f} min" if mae is not None else "N/A",
+        f"{duration_metric_minutes(mae, vehicle):.1f} min" if mae is not None else "N/A",
         help="Mean Absolute Error",
     )
 
     c2.metric(
         "RMSE",
-        f"{rmse / 60.0:.1f} min" if rmse is not None else "N/A",
+        f"{duration_metric_minutes(rmse, vehicle):.1f} min" if rmse is not None else "N/A",
         help="Root Mean Squared Error",
     )
 
@@ -1892,7 +2366,7 @@ def dashboard_duration(
     explanation_box(
         f"""
         For <b>{vehicle}</b>, the model's average prediction error
-        is approximately <b>{mae / 60.0:.1f} minutes</b>.
+        is approximately <b>{duration_metric_minutes(mae, vehicle):.1f} minutes</b>.
         """ if mae is not None else
         f"""
         Duration metrics for <b>{vehicle}</b> were only partially available.
@@ -2035,7 +2509,7 @@ def select_accurate_zone_for_chart(
         return None
 
     try:
-        df = duckdb.sql(
+        df = _duckdb_sql(
             f"""
             SELECT
                 zone_id,
@@ -2122,7 +2596,7 @@ def dashboard_zone_demand(
     # TOP BUSIEST ZONES
     # ------------------------------------------------------------------------
 
-    top = duckdb.sql(
+    top = _duckdb_sql(
         f"""
         SELECT
 
@@ -2212,7 +2686,7 @@ def dashboard_zone_demand(
 
     if accurate_zone is not None:
 
-        zone_sample = duckdb.sql(
+        zone_sample = _duckdb_sql(
             f"""
             SELECT pickup_hour_ts, actual, predicted
             FROM read_parquet('{preds_path.as_posix()}')
@@ -2260,7 +2734,7 @@ def dashboard_zone_demand(
 
         return
 
-    zone_pred = duckdb.sql(
+    zone_pred = _duckdb_sql(
         f"""
         SELECT
             pickup_hour_ts,
@@ -2392,15 +2866,17 @@ def page_dashboard():
                 {
                     "Vehicle": vehicle,
                     "Task": "Trip Duration",
-                    "MAE": (
-                        dur.get("MAE") / 60.0
-                        if dur.get("MAE") is not None
-                        else None
+                    "MAE": duration_metric_minutes(
+                        dur.get("MAE"), vehicle
+                    ),
+                    "RMSE": duration_metric_minutes(
+                        dur.get("RMSE"), vehicle
                     ),
                     "R²": dur.get("R2"),
                     "Status": (
                         "Available"
                         if dur.get("MAE") is not None
+                        and dur.get("RMSE") is not None
                         and dur.get("R2") is not None
                         else "Unavailable"
                     ),
@@ -2419,11 +2895,13 @@ def page_dashboard():
                     "Vehicle": vehicle,
                     "Task": "Citywide Demand",
                     "MAE": dem.get("MAE") if dem else None,
+                    "RMSE": dem.get("RMSE") if dem else None,
                     "R²": dem.get("R2") if dem else None,
                     "Status": (
                         "Available"
                         if dem
                         and dem.get("MAE") is not None
+                        and dem.get("RMSE") is not None
                         and dem.get("R2") is not None
                         else "Unavailable"
                     ),
@@ -2442,11 +2920,13 @@ def page_dashboard():
                     "Vehicle": vehicle,
                     "Task": "Zone Demand",
                     "MAE": zon.get("MAE") if zon else None,
+                    "RMSE": zon.get("RMSE") if zon else None,
                     "R²": zon.get("R2") if zon else None,
                     "Status": (
                         "Available"
                         if zon
                         and zon.get("MAE") is not None
+                        and zon.get("RMSE") is not None
                         and zon.get("R2") is not None
                         else "Unavailable"
                     ),
@@ -2465,6 +2945,11 @@ def page_dashboard():
                         if pd.isna(value)
                         else f"{value:.2f}"
                     ),
+                    "RMSE": lambda value: (
+                        "N/A"
+                        if pd.isna(value)
+                        else f"{value:.2f}"
+                    ),
                     "R²": lambda value: (
                         "N/A"
                         if pd.isna(value)
@@ -2474,12 +2959,11 @@ def page_dashboard():
             ),
             use_container_width=True,
             hide_index=True,
-            height=520,
         )
 
         st.caption(
-            "Trip Duration MAE is shown in minutes. "
-            "Citywide and Zone Demand MAE values are shown in their "
+            "Trip Duration MAE/RMSE are shown in minutes. "
+            "Citywide and Zone Demand MAE/RMSE values are shown in their "
             "respective trip-count units. N/A means the saved evaluation "
             "result for that model/task is not available."
         )
@@ -2541,6 +3025,7 @@ def page_dashboard():
             missing results are explicitly listed rather than treated as zero.
             """
         )
+
 
     # ------------------------------------------------------------------------
     # YELLOW TAXI
@@ -2687,7 +3172,7 @@ def analysis_schema(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=["column_name", "column_type"])
     try:
-        return duckdb.sql(
+        return _duckdb_sql(
             f"DESCRIBE SELECT * FROM read_parquet('{_sql_path(path)}')"
         ).df()[["column_name", "column_type"]]
     except Exception:
@@ -2717,7 +3202,7 @@ def analysis_vehicle_monthly(vehicle: str) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame(columns=["month", "month_name", "trips"])
     try:
-        return duckdb.sql(
+        return _duckdb_sql(
             f"""
             SELECT EXTRACT(month FROM pickup_hour_ts)::INTEGER AS month,
                    strftime(pickup_hour_ts, '%b') AS month_name,
@@ -2738,7 +3223,7 @@ def analysis_vehicle_hour_dow(vehicle: str) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     try:
-        return duckdb.sql(
+        return _duckdb_sql(
             f"""
             SELECT EXTRACT(dow FROM pickup_hour_ts)::INTEGER AS dow,
                    EXTRACT(hour FROM pickup_hour_ts)::INTEGER AS hour,
@@ -2759,7 +3244,7 @@ def analysis_top_zones(vehicle: str, limit: int = 15) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
     try:
-        return duckdb.sql(
+        return _duckdb_sql(
             f"""
             SELECT zone_id,
                    any_value(zone_name) AS zone_name,
@@ -2805,8 +3290,8 @@ def _analysis_model_table() -> pd.DataFrame:
         dem = sql_regression_metrics(cfg["demand_predictions"])
         zone = sql_regression_metrics(cfg["zone_demand_predictions"])
         rows += [
-            {"Vehicle": vehicle, "Task": "Trip Duration", "MAE": dur.get("MAE") / 60 if dur.get("MAE") is not None else None,
-             "RMSE": dur.get("RMSE") / 60 if dur.get("RMSE") is not None else None, "R²": dur.get("R2")},
+            {"Vehicle": vehicle, "Task": "Trip Duration", "MAE": duration_metric_minutes(dur.get("MAE"), vehicle),
+             "RMSE": duration_metric_minutes(dur.get("RMSE"), vehicle), "R²": dur.get("R2")},
             {"Vehicle": vehicle, "Task": "Citywide Demand", "MAE": dem.get("MAE") if dem else None,
              "RMSE": dem.get("RMSE") if dem else None, "R²": dem.get("R2") if dem else None},
             {"Vehicle": vehicle, "Task": "Zone Demand", "MAE": zone.get("MAE") if zone else None,
@@ -2957,7 +3442,7 @@ def page_data_analysis():
                 st.plotly_chart(fig, use_container_width=True)
 
             st.subheader("What do MAE, RMSE and R² mean?")
-            explanation_box("<b>MAE</b> = average absolute error. <b>RMSE</b> penalizes large errors more strongly. <b>R²</b> measures how much variation the model explains relative to a simple mean baseline. For trip-duration models the dashboard converts MAE/RMSE from seconds to minutes. For demand models the error is trips per hour. There is no honest single 'accuracy %' for these regression tasks unless a separate tolerance-based accuracy definition is explicitly chosen.")
+            explanation_box("<b>MAE</b> = average absolute error. <b>RMSE</b> penalizes large errors more strongly. <b>R²</b> measures how much variation the model explains relative to a simple mean baseline. For trip-duration models the dashboard displays MAE/RMSE in minutes; FHV metrics are already stored in minutes, while the other duration metrics are stored in seconds. For demand models the error is trips per hour. There is no honest single 'accuracy %' for these regression tasks unless a separate tolerance-based accuracy definition is explicitly chosen.")
 
             # Feature importance cards where the saved metrics contain importances.
             for vehicle in available:

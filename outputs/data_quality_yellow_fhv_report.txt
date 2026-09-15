@@ -1,0 +1,5 @@
+NYC TLC DATA QUALITY AUDIT
+======================================================================
+Scope: Yellow Taxi + FHV
+
+No flags raised. All checked invariants passed.

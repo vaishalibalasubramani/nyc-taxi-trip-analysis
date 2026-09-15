@@ -2901,11 +2901,17 @@ def page_dashboard():
                 {
                     "Vehicle": vehicle,
                     "Task": "Trip Duration",
-                    "MAE": duration_metric_minutes(dur.get("MAE"), vehicle),
+                    "MAE": duration_metric_minutes(
+                        dur.get("MAE"), vehicle
+                    ),
+                    "RMSE": duration_metric_minutes(
+                        dur.get("RMSE"), vehicle
+                    ),
                     "R²": dur.get("R2"),
                     "Status": (
                         "Available"
                         if dur.get("MAE") is not None
+                        and dur.get("RMSE") is not None
                         and dur.get("R2") is not None
                         else "Unavailable"
                     ),
@@ -2924,11 +2930,13 @@ def page_dashboard():
                     "Vehicle": vehicle,
                     "Task": "Citywide Demand",
                     "MAE": dem.get("MAE") if dem else None,
+                    "RMSE": dem.get("RMSE") if dem else None,
                     "R²": dem.get("R2") if dem else None,
                     "Status": (
                         "Available"
                         if dem
                         and dem.get("MAE") is not None
+                        and dem.get("RMSE") is not None
                         and dem.get("R2") is not None
                         else "Unavailable"
                     ),
@@ -2947,11 +2955,13 @@ def page_dashboard():
                     "Vehicle": vehicle,
                     "Task": "Zone Demand",
                     "MAE": zon.get("MAE") if zon else None,
+                    "RMSE": zon.get("RMSE") if zon else None,
                     "R²": zon.get("R2") if zon else None,
                     "Status": (
                         "Available"
                         if zon
                         and zon.get("MAE") is not None
+                        and zon.get("RMSE") is not None
                         and zon.get("R2") is not None
                         else "Unavailable"
                     ),
@@ -2970,6 +2980,11 @@ def page_dashboard():
                         if pd.isna(value)
                         else f"{value:.2f}"
                     ),
+                    "RMSE": lambda value: (
+                        "N/A"
+                        if pd.isna(value)
+                        else f"{value:.2f}"
+                    ),
                     "R²": lambda value: (
                         "N/A"
                         if pd.isna(value)
@@ -2979,12 +2994,11 @@ def page_dashboard():
             ),
             use_container_width=True,
             hide_index=True,
-            height=520,
         )
 
         st.caption(
-            "Trip Duration MAE is shown in minutes. "
-            "Citywide and Zone Demand MAE values are shown in their "
+            "Trip Duration MAE/RMSE are shown in minutes. "
+            "Citywide and Zone Demand MAE/RMSE values are shown in their "
             "respective trip-count units. N/A means the saved evaluation "
             "result for that model/task is not available."
         )
@@ -3046,6 +3060,7 @@ def page_dashboard():
             missing results are explicitly listed rather than treated as zero.
             """
         )
+
 
     # ------------------------------------------------------------------------
     # YELLOW TAXI

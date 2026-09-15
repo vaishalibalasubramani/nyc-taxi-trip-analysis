@@ -1,0 +1,3 @@
+Vehicle,Model,Rows,MAE_seconds,MAE_minutes,RMSE_seconds,RMSE_minutes,R2,Baseline_MAE_seconds,MAE_improvement_percent,Status
+Yellow Taxi,GradientBoostingRegressor,100000,233.73,3.896,375.41,6.257,0.8182,603.73,61.29,PASS
+FHV,GradientBoostingRegressor,100000,622.05,10.368,899.46,14.991,0.5707,1052.56,40.9,PASS
